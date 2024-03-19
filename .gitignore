@@ -1,0 +1,5 @@
+__pycache__/
+Reading-tests.ipynb
+radiosondes/*/era5/
+radiosondes/SantaColoma_2021-07-24/
+.ipynb_checkpoints/
