@@ -3,7 +3,7 @@ import numpy as np
 import thermo
 
 def plume_ascent(theta_l_e, q_t_e, pres_e, height, theta_l_p_0, q_t_p_0, area_plume_0, w_p_0,
-                 a_w = 1, b_w = 0, lambda_mix = 30, height_surface_layer = 100, beta = 1):
+                 a_w = 1, b_w = 0, fac_ent = 1, beta = 1):
     """
     Dynamically lift an entraining parcel (plume) through a specified
     environment, given an initial parcel state. Loosely based on the
@@ -30,15 +30,7 @@ def plume_ascent(theta_l_e, q_t_e, pres_e, height, theta_l_p_0, q_t_p_0, area_pl
                      vertical velocity equation [-]
     b_w:             float scaling factor for the drag term in the plume
                      vertical velocity equation [-]
-    lambda_mix:      Mixing length for plume detrainment within the surface layer
-                     [m]
-    height_surface_layer:
-                     Height [m] where mixing formulation switches from Rio et al.
-                     (2010)'s constant-area formulation to constant fractional
-                     entrainment/detrainment. This is still an arbitrary choice
-                     which will have large effects on the model outcomes, and
-                     which we will need to improve as we learn more by testing
-                     the model for different fires.
+    fac_ent:         Factor scaling the fractional entrainment
     beta:            Ratio of fractional entrainment to detrainment above the
                      surface layer. Normally expect this to be <=1.
 
@@ -53,15 +45,12 @@ def plume_ascent(theta_l_e, q_t_e, pres_e, height, theta_l_p_0, q_t_p_0, area_pl
 
     ## Checks that will save crashes
     # A minimum initial updraft speed is needed to not produce infinite entrainment
-    if w_p_0<1e-3:
-        w_p_0 = 1e-3
+    if w_p_0<0.1:
+        w_p_0 = 0.1
     
     
     ## Initialisation
-    
-    # Iteration parameters
-    crossed_surface_layer = False 
-    
+        
     # Plume arrays in an xarray dataset
     init_prof = np.zeros(height.size)
     ds = xr.Dataset({'theta_l_e':('height', theta_l_e),
@@ -103,56 +92,61 @@ def plume_ascent(theta_l_e, q_t_e, pres_e, height, theta_l_p_0, q_t_p_0, area_pl
     ds['a_p'][0] = area_plume_0
     ds['w_p'][0] = w_p_0
     ds['mass_flux_p'][0] = ds['rho_e'][0] * ds['a_p'][0] * ds['w_p'][0]
-    ds['entrainment'][0] = (ds['a_p'][0] * ds['rho_e'][0]) / (2 * ds['w_p'][0]) * ds['buoyancy_p'][0]
+
+    epsi = fac_ent*beta#/np.sqrt(ds['a_p'][0])
+    delt = epsi/beta
     
+    ds['entrainment'][0] = epsi*ds['mass_flux_p'][0]
+    ds['detrainment'][0] = 0.
     
     ## Loop until plume top
     # Use all values at height index i-1 to calculate the values at height index i (simple forward Euler)
     dz = ds['height'].diff('height')
     for i in range(1, ds['height'].size):
-
+        
         # Mass flux through plume
         ds['mass_flux_p'][i] = ds['mass_flux_p'][i-1] + (ds['entrainment'][i-1] - ds['detrainment'][i-1]) * dz[i-1]
 
         # Thermodynamics (environment)
-        ds['T_e'][i], ds['q_l_e'][i], ds['theta_e'][i], ds['theta_v_e'][i] = thermo.calculate_thermo(ds['theta_l_e'][i], ds['q_t_e'][i], ds['pres_e'][i])
+        try:
+            ds['T_e'][i], ds['q_l_e'][i], ds['theta_e'][i], ds['theta_v_e'][i] = thermo.calculate_thermo(ds['theta_l_e'][i], ds['q_t_e'][i], ds['pres_e'][i])
+        except:
+            print('Failed thermo env, height', ds['height'][i].data)
+            return ds
         ds['rho_e'][i] = ds['pres_e'][i]/thermo.rd/ds['T_e'][i]
         
         # Thermodynamics (plume)
         ds['theta_l_p'][i] = ds['theta_l_p'][i-1] + ds['entrainment'][i-1] * (ds['theta_l_e'][i-1] - ds['theta_l_p'][i-1]) / ds['mass_flux_p'][i-1] * dz[i-1]
         ds['q_t_p'][i] = ds['q_t_p'][i-1] + ds['entrainment'][i-1] * (ds['q_t_e'][i-1] - ds['q_t_p'][i-1]) / ds['mass_flux_p'][i-1] * dz[i-1]
-        ds['T_p'][i], ds['q_l_p'][i], ds['theta_p'][i], ds['theta_v_p'][i] = thermo.calculate_thermo(ds['theta_l_p'][i], ds['q_t_p'][i], ds['pres_e'][i])
+        try:
+            ds['T_p'][i], ds['q_l_p'][i], ds['theta_p'][i], ds['theta_v_p'][i] = thermo.calculate_thermo(ds['theta_l_p'][i], ds['q_t_p'][i], ds['pres_e'][i])
+        except:
+            print('Failed thermo env, height', ds['height'][i].data)
+            return ds
         ds['buoyancy_p'][i] = thermo.grav / ds['theta_v_e'][i] * (ds['theta_v_p'][i] - ds['theta_v_e'][i])
 
         # Vertical velocity
         # In the w-eq, the scaling factors for buoyancy (a_w) and entrainment (b_w) are not well-constrained,
-        # see e.g. de Roode et al. (2012). This may require tuning.
-        ds['w_p'][i] = (-b_w * ds['entrainment'][i-1] * ds['w_p'][i-1] + a_w * ds['a_p'][i-1] * ds['rho_e'][i-1] * ds['buoyancy_p'][i-1]) / ds['mass_flux_p'][i-1] * dz[i-1] + ds['w_p'][i-1]
+        # see e.g. de Roode et al. (2012), Romps & Charn (2015). We leave them as free parameters to tune.
 
-        # Entrainment and detrainment in the surface layer
-        # From the model by Rio et al. (2010), which assumes:
-        # - plume area * density = constant, i.e. acceleration is balanced by entrainment (were there no detrainment)
-        # - erosion of the plume (detrainment) with a mixing length lambda_mix (it is probably okay to drop this term completely inside the surface layer)
-        ds['entrainment'][i] = (ds['a_p'][i-1] * ds['rho_e'][i-1]) / (2 * ds['w_p'][i-1]) * ds['buoyancy_p'][i-1]
-        ds['detrainment'][i] = ds['a_p'][i-1] * ds['rho_e'][i-1] * np.sqrt(lambda_mix) / np.sqrt(area_plume_0) * (np.sqrt(ds['height'][i]) * (ds['w_p'][i] - ds['w_p'][i-1]) / dz[i-1] +
-                                                                                                   ds['w_p'][i-1] / (2 * np.sqrt(ds['height'][i]))
-                                                                                                  )
-        # Entrainment and detrainment above the surface layer
-        # Siebesma & Holtslag (1996) - like, using the value at the (arbitrarily chosen) surface layer height
-        if ds['height'][i] > height_surface_layer:
-            if not crossed_surface_layer:
-                epsi = ds['entrainment'][i] / ds['mass_flux_p'][i]
-                delt = epsi / beta
-                crossed_surface_layer = True
-
-            ds['entrainment'][i] = epsi * ds['mass_flux_p'][i]
-            ds['detrainment'][i] = delt * ds['mass_flux_p'][i]
+        dwp2 = 2*(a_w*ds['buoyancy_p'][i-1] - b_w*epsi*ds['w_p'][i-1]**2)*dz[i-1]
+        if dwp2 + ds['w_p'][i-1]**2 < 0:
+            # Kinetic energy cannot go below 0
+            ds['w_p'][i] = 0
+        else:
+            ds['w_p'][i] = np.sqrt(dwp2 + ds['w_p'][i-1]**2)
+        
+        # Entrainment and detrainment
+        # Siebesma & Holtslag (1996) - like everywhere, with epsi and delt fixed with height
+        # This is almost certainly wrong, but we have to start somewhere
+        ds['entrainment'][i] = epsi * ds['mass_flux_p'][i]
+        ds['detrainment'][i] = delt * ds['mass_flux_p'][i]
 
         # Update area fraction to be consistent with the new mass flux, vertical velocity and density
         ds['a_p'][i] = ds['mass_flux_p'][i] / (ds['rho_e'][i] * ds['w_p'][i])
 
         # Discontinuous plume top where the plume is no longer ascending, or the area is zero
-        if ds['w_p'][i] < 0 or ds['a_p'][i] < 0:
+        if ds['w_p'][i] <= 0 or ds['a_p'][i] <= 0:
 
             # Above this height, complete the environmental and plume thermodynamic profiles so they are equal
             for j in range(i, ds['height'].size):
